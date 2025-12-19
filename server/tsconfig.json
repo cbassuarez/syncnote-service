@@ -1,0 +1,19 @@
+//
+//  tsconfig.js
+//  
+//
+//  Created by Sebastian Suarez-Solis on 12/18/25.
+//
+
+
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "commonjs",
+    "outDir": "dist",
+    "esModuleInterop": true,
+    "strict": true,
+    "skipLibCheck": true
+  },
+  "include": ["./**/*.ts"]
+}
