@@ -1006,7 +1006,7 @@ app.get("/health", (_req, res) => {
     const backupAgeSeconds = lastBackupRunAt == null ? null : Math.max(0, Math.floor((now.getTime() - lastBackupRunAt.getTime()) / 1000));
     res.json({
         ok: true,
-        incidentContact: "mailto:developer.com",
+        incidentContact: "mailto:developer@stagedevices.com",
         db: {
             path: dbPath,
             writable: dbWritableStatus(),
