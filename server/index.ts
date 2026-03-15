@@ -1,7 +1,7 @@
 // server/index.ts
 
 import cors from "cors";
-import { createPrivateKey, createSign, randomUUID } from "crypto";
+import { createHash, createPrivateKey, createSign, randomUUID } from "crypto";
 import express from "express";
 import http from "http";
 import { WebSocket, WebSocketServer } from "ws";
@@ -29,6 +29,8 @@ type PromotionalOfferSignatureRequest = {
 type Client = {
   ws: WebSocket;
   padId: string;
+  isAlive: boolean;
+  lastPongAt: number;
 };
 
 const defaultPromotionalOfferProductIDs = ["CHRNPROANNUALLY"];
@@ -145,10 +147,46 @@ function ensureSnapshot(padId: string): Snapshot {
   return snap;
 }
 
+function snapshotETag(snapshot: Snapshot): string {
+  const digest = createHash("sha1")
+    .update(String(snapshot.version))
+    .update(invisibleSeparator)
+    .update(snapshot.lastModified)
+    .update(invisibleSeparator)
+    .update(snapshot.deviceID)
+    .update(invisibleSeparator)
+    .update(snapshot.text)
+    .digest("hex");
+
+  return `"${digest}"`;
+}
+
+function normalizeETag(tag: string): string {
+  return tag.trim().replace(/^W\//i, "");
+}
+
+function etagMatches(ifNoneMatchHeader: string, currentETag: string): boolean {
+  const normalizedCurrent = normalizeETag(currentETag);
+  return ifNoneMatchHeader
+    .split(",")
+    .map((part) => part.trim())
+    .some((candidate) => candidate === "*" || normalizeETag(candidate) === normalizedCurrent);
+}
+
 // GET /pads/:padId – return latest snapshot for this pad
 app.get("/pads/:padId", (req, res) => {
   const padId = req.params.padId;
   const snap = ensureSnapshot(padId);
+  const etag = snapshotETag(snap);
+
+  const ifNoneMatch = req.header("if-none-match");
+  if (ifNoneMatch && etagMatches(ifNoneMatch, etag)) {
+    res.setHeader("ETag", etag);
+    res.status(304).send();
+    return;
+  }
+
+  res.setHeader("ETag", etag);
   res.json(snap);
 });
 
@@ -175,7 +213,8 @@ app.put("/pads/:padId", (req, res) => {
   const current = ensureSnapshot(padId);
   const currentDate = new Date(current.lastModified);
 
-  if (!current || incomingDate > currentDate) {
+  let canonicalSnapshot: Snapshot;
+  if (incomingDate > currentDate) {
     globalVersionCounter += 1;
     const updated: Snapshot = {
       text: body.text,
@@ -185,11 +224,14 @@ app.put("/pads/:padId", (req, res) => {
     };
     pads.set(padId, updated);
     broadcastSnapshot(padId);
-    res.json(updated);
+    canonicalSnapshot = updated;
   } else {
     // Stale write, but we still return canonical snapshot
-    res.status(200).json(current);
+    canonicalSnapshot = current;
   }
+
+  res.setHeader("ETag", snapshotETag(canonicalSnapshot));
+  res.status(200).json(canonicalSnapshot);
 });
 
 // DELETE /pads/:padId – clear this pad and broadcast reset state
@@ -275,6 +317,8 @@ const wss = new WebSocketServer({
 
 // Track clients + which pad they’re subscribed to
 const clients = new Set<Client>();
+const wsHeartbeatIntervalMs = 25_000;
+const wsStaleTimeoutMs = 75_000;
 
 wss.on("connection", (ws: WebSocket, req) => {
   const url = req.url || "";
@@ -292,8 +336,18 @@ wss.on("connection", (ws: WebSocket, req) => {
   const snap = ensureSnapshot(padId);
   ws.send(JSON.stringify(snap));
 
-  const client: Client = { ws, padId };
+  const client: Client = {
+    ws,
+    padId,
+    isAlive: true,
+    lastPongAt: Date.now(),
+  };
   clients.add(client);
+
+  ws.on("pong", () => {
+    client.isAlive = true;
+    client.lastPongAt = Date.now();
+  });
 
   ws.on("close", () => {
     console.log("WebSocket client disconnected for pad:", padId);
@@ -303,6 +357,37 @@ wss.on("connection", (ws: WebSocket, req) => {
   ws.on("error", (err) => {
     console.error("WebSocket error:", err);
   });
+});
+
+const wsHeartbeat = setInterval(() => {
+  const now = Date.now();
+
+  for (const client of clients) {
+    if (client.ws.readyState !== WebSocket.OPEN) {
+      clients.delete(client);
+      continue;
+    }
+
+    if (now - client.lastPongAt > wsStaleTimeoutMs) {
+      console.warn("Terminating stale WebSocket client for pad:", client.padId);
+      client.ws.terminate();
+      clients.delete(client);
+      continue;
+    }
+
+    client.isAlive = false;
+    try {
+      client.ws.ping();
+    } catch (error) {
+      console.error("Failed to ping WebSocket client:", error);
+      client.ws.terminate();
+      clients.delete(client);
+    }
+  }
+}, wsHeartbeatIntervalMs);
+
+wss.on("close", () => {
+  clearInterval(wsHeartbeat);
 });
 
 function broadcastSnapshot(padId: string) {
