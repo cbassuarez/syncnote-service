@@ -1312,6 +1312,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
+    incidentContact: "mailto:developer.com",
     db: {
       path: dbPath,
       writable: dbWritableStatus(),
