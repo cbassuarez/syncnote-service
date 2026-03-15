@@ -192,6 +192,27 @@ app.put("/pads/:padId", (req, res) => {
   }
 });
 
+// DELETE /pads/:padId – clear this pad and broadcast reset state
+app.delete("/pads/:padId", (req, res) => {
+  const padId = req.params.padId;
+  const existed = pads.delete(padId);
+  if (existed) {
+    console.log("Deleted pad:", padId);
+  }
+
+  globalVersionCounter += 1;
+  const cleared: Snapshot = {
+    text: "",
+    lastModified: new Date().toISOString(),
+    deviceID: "server",
+    version: globalVersionCounter,
+  };
+  pads.set(padId, cleared);
+  broadcastSnapshot(padId);
+
+  res.status(204).send();
+});
+
 app.get("/billing/promotional-offers/status", (_req, res) => {
   const config = promotionalOfferSigningConfig();
   res.json({
