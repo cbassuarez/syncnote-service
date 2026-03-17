@@ -19,6 +19,7 @@ import {
 import http from "http";
 import path from "path";
 import { WebSocket, WebSocketServer } from "ws";
+import { validateWithToolchains, type DeepValidationRequest } from "./validation";
 
 type Snapshot = {
   text: string;
@@ -32,9 +33,20 @@ type Snapshot = {
   byteSize?: number | null;
   pinTitle?: string | null;
   pinNote?: string | null;
+  milestoneLabel?: string | null;
+  milestoneKind?: string | null;
+  sessionID?: string | null;
+  restoreGroupID?: string | null;
+  changeSummary?: SnapshotChangeSummary | null;
 };
 
 type SnapshotPayload = Partial<Snapshot>;
+
+type SnapshotChangeSummary = {
+  linesChanged: number;
+  characterDelta: number;
+  byteDelta?: number | null;
+};
 
 type SnapshotRecord = {
   snapshotID: string;
@@ -44,8 +56,14 @@ type SnapshotRecord = {
   language?: string | null;
   byteSize?: number | null;
   reason?: string | null;
+  source?: string | null;
   pinTitle?: string | null;
   pinNote?: string | null;
+  milestoneLabel?: string | null;
+  milestoneKind?: string | null;
+  sessionID?: string | null;
+  restoreGroupID?: string | null;
+  changeSummary?: SnapshotChangeSummary | null;
 };
 
 type SnapshotCursor = {
@@ -86,6 +104,11 @@ type PadRow = {
   byte_size: number | null;
   pin_title: string | null;
   pin_note: string | null;
+  milestone_label: string | null;
+  milestone_kind: string | null;
+  session_id: string | null;
+  restore_group_id: string | null;
+  change_summary_json: string | null;
   updated_at_unix: number;
 };
 
@@ -103,6 +126,11 @@ type SnapshotRow = {
   pin_title: string | null;
   pin_note: string | null;
   is_pinned: number;
+  milestone_label: string | null;
+  milestone_kind: string | null;
+  session_id: string | null;
+  restore_group_id: string | null;
+  change_summary_json: string | null;
 };
 
 type MetadataRow = {
@@ -123,6 +151,12 @@ type BackupConfig = {
   keyPrefix: string;
 };
 
+type SnapshotSendMode = "scheduled" | "forced";
+
+type SnapshotCreatedAtRow = {
+  created_at_unix: number;
+};
+
 const defaultPromotionalOfferProductIDs = ["CHRNPROANNUALLY"];
 const invisibleSeparator = "\u2063";
 const maxSnapshotBytes = 1_048_576;
@@ -138,6 +172,7 @@ const schedulerTickIntervalMs = 60 * 1_000;
 
 const wsHeartbeatIntervalMs = 25_000;
 const wsStaleTimeoutMs = 75_000;
+const scheduledAutoTimelinePromotionIntervalSeconds = 5 * 60;
 
 const backupKeepLocalDays = Number(process.env.BACKUP_KEEP_LOCAL_DAYS || "14");
 
@@ -163,17 +198,23 @@ const backupConfig = buildBackupConfig();
 const statements = {
   selectPad: db.prepare(
     `SELECT pad_id, text, last_modified, device_id, version, language, snapshot_id,
-            checkpoint_reason, checkpoint_source, byte_size, pin_title, pin_note, updated_at_unix
+            checkpoint_reason, checkpoint_source, byte_size, pin_title, pin_note,
+            milestone_label, milestone_kind, session_id, restore_group_id, change_summary_json,
+            updated_at_unix
      FROM pads
      WHERE pad_id = ?`
   ),
   upsertPad: db.prepare(
     `INSERT INTO pads (
        pad_id, text, last_modified, device_id, version, language, snapshot_id,
-       checkpoint_reason, checkpoint_source, byte_size, pin_title, pin_note, updated_at_unix
+       checkpoint_reason, checkpoint_source, byte_size, pin_title, pin_note,
+       milestone_label, milestone_kind, session_id, restore_group_id, change_summary_json,
+       updated_at_unix
      ) VALUES (
        @pad_id, @text, @last_modified, @device_id, @version, @language, @snapshot_id,
-       @checkpoint_reason, @checkpoint_source, @byte_size, @pin_title, @pin_note, @updated_at_unix
+       @checkpoint_reason, @checkpoint_source, @byte_size, @pin_title, @pin_note,
+       @milestone_label, @milestone_kind, @session_id, @restore_group_id, @change_summary_json,
+       @updated_at_unix
      )
      ON CONFLICT(pad_id) DO UPDATE SET
        text = excluded.text,
@@ -187,27 +228,50 @@ const statements = {
        byte_size = excluded.byte_size,
        pin_title = excluded.pin_title,
        pin_note = excluded.pin_note,
+       milestone_label = excluded.milestone_label,
+       milestone_kind = excluded.milestone_kind,
+       session_id = excluded.session_id,
+       restore_group_id = excluded.restore_group_id,
+       change_summary_json = excluded.change_summary_json,
        updated_at_unix = excluded.updated_at_unix`
   ),
   deletePad: db.prepare(`DELETE FROM pads WHERE pad_id = ?`),
   insertSnapshot: db.prepare(
     `INSERT OR REPLACE INTO snapshots (
       snapshot_id, pad_id, text, created_at, created_at_unix, device_id,
-      language, byte_size, reason, source, pin_title, pin_note, is_pinned
+      language, byte_size, reason, source, pin_title, pin_note,
+      milestone_label, milestone_kind, session_id, restore_group_id, change_summary_json,
+      is_pinned
     ) VALUES (
       @snapshot_id, @pad_id, @text, @created_at, @created_at_unix, @device_id,
-      @language, @byte_size, @reason, @source, @pin_title, @pin_note, @is_pinned
+      @language, @byte_size, @reason, @source, @pin_title, @pin_note,
+      @milestone_label, @milestone_kind, @session_id, @restore_group_id, @change_summary_json,
+      @is_pinned
     )`
   ),
   selectSnapshotById: db.prepare(
     `SELECT snapshot_id, pad_id, text, created_at, created_at_unix, device_id,
-            language, byte_size, reason, source, pin_title, pin_note, is_pinned
+            language, byte_size, reason, source, pin_title, pin_note,
+            milestone_label, milestone_kind, session_id, restore_group_id, change_summary_json,
+            is_pinned
      FROM snapshots
      WHERE pad_id = ? AND snapshot_id = ?`
   ),
+  selectLatestScheduledAutoSnapshotCreatedAt: db.prepare(
+    `SELECT created_at_unix
+     FROM snapshots
+     WHERE pad_id = ?
+       AND is_pinned = 0
+       AND reason = 'autoEditBatch'
+       AND source = 'local'
+     ORDER BY created_at_unix DESC, snapshot_id DESC
+     LIMIT 1`
+  ),
   listSnapshotsFirstPage: db.prepare(
     `SELECT snapshot_id, pad_id, text, created_at, created_at_unix, device_id,
-            language, byte_size, reason, source, pin_title, pin_note, is_pinned
+            language, byte_size, reason, source, pin_title, pin_note,
+            milestone_label, milestone_kind, session_id, restore_group_id, change_summary_json,
+            is_pinned
      FROM snapshots
      WHERE pad_id = @pad_id
      ORDER BY created_at_unix DESC, snapshot_id DESC
@@ -215,7 +279,9 @@ const statements = {
   ),
   listSnapshotsAfterCursor: db.prepare(
     `SELECT snapshot_id, pad_id, text, created_at, created_at_unix, device_id,
-            language, byte_size, reason, source, pin_title, pin_note, is_pinned
+            language, byte_size, reason, source, pin_title, pin_note,
+            milestone_label, milestone_kind, session_id, restore_group_id, change_summary_json,
+            is_pinned
      FROM snapshots
      WHERE pad_id = @pad_id
        AND (
@@ -301,6 +367,11 @@ function migrateSchema(database: Database.Database): void {
       byte_size INTEGER,
       pin_title TEXT,
       pin_note TEXT,
+      milestone_label TEXT,
+      milestone_kind TEXT,
+      session_id TEXT,
+      restore_group_id TEXT,
+      change_summary_json TEXT,
       updated_at_unix INTEGER NOT NULL
     );
 
@@ -317,6 +388,11 @@ function migrateSchema(database: Database.Database): void {
       source TEXT,
       pin_title TEXT,
       pin_note TEXT,
+      milestone_label TEXT,
+      milestone_kind TEXT,
+      session_id TEXT,
+      restore_group_id TEXT,
+      change_summary_json TEXT,
       is_pinned INTEGER NOT NULL DEFAULT 0,
       FOREIGN KEY(pad_id) REFERENCES pads(pad_id) ON DELETE CASCADE
     );
@@ -340,6 +416,11 @@ function migrateSchema(database: Database.Database): void {
   ensureColumn("pads", "byte_size", "INTEGER");
   ensureColumn("pads", "pin_title", "TEXT");
   ensureColumn("pads", "pin_note", "TEXT");
+  ensureColumn("pads", "milestone_label", "TEXT");
+  ensureColumn("pads", "milestone_kind", "TEXT");
+  ensureColumn("pads", "session_id", "TEXT");
+  ensureColumn("pads", "restore_group_id", "TEXT");
+  ensureColumn("pads", "change_summary_json", "TEXT");
   ensureColumn("pads", "updated_at_unix", "INTEGER NOT NULL DEFAULT 0");
 
   ensureColumn("snapshots", "language", "TEXT");
@@ -348,6 +429,11 @@ function migrateSchema(database: Database.Database): void {
   ensureColumn("snapshots", "source", "TEXT");
   ensureColumn("snapshots", "pin_title", "TEXT");
   ensureColumn("snapshots", "pin_note", "TEXT");
+  ensureColumn("snapshots", "milestone_label", "TEXT");
+  ensureColumn("snapshots", "milestone_kind", "TEXT");
+  ensureColumn("snapshots", "session_id", "TEXT");
+  ensureColumn("snapshots", "restore_group_id", "TEXT");
+  ensureColumn("snapshots", "change_summary_json", "TEXT");
   ensureColumn("snapshots", "is_pinned", "INTEGER NOT NULL DEFAULT 0");
 }
 
@@ -487,6 +573,39 @@ function snapshotETag(snapshot: Snapshot): string {
   return `"${digest}"`;
 }
 
+function parseChangeSummary(raw: string | null): SnapshotChangeSummary | null {
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as SnapshotChangeSummary;
+    if (
+      typeof parsed.linesChanged !== "number" ||
+      !Number.isFinite(parsed.linesChanged) ||
+      typeof parsed.characterDelta !== "number" ||
+      !Number.isFinite(parsed.characterDelta)
+    ) {
+      return null;
+    }
+
+    if (
+      parsed.byteDelta != null &&
+      (typeof parsed.byteDelta !== "number" || !Number.isFinite(parsed.byteDelta))
+    ) {
+      return null;
+    }
+
+    return {
+      linesChanged: Math.floor(parsed.linesChanged),
+      characterDelta: Math.floor(parsed.characterDelta),
+      byteDelta: parsed.byteDelta == null ? null : Math.floor(parsed.byteDelta),
+    };
+  } catch {
+    return null;
+  }
+}
+
 function rowToSnapshot(row: PadRow): Snapshot {
   return {
     text: row.text,
@@ -500,6 +619,11 @@ function rowToSnapshot(row: PadRow): Snapshot {
     byteSize: row.byte_size,
     pinTitle: row.pin_title,
     pinNote: row.pin_note,
+    milestoneLabel: row.milestone_label,
+    milestoneKind: row.milestone_kind,
+    sessionID: row.session_id,
+    restoreGroupID: row.restore_group_id,
+    changeSummary: parseChangeSummary(row.change_summary_json),
   };
 }
 
@@ -512,9 +636,26 @@ function rowToSnapshotRecord(row: SnapshotRow): SnapshotRecord {
     language: row.language,
     byteSize: row.byte_size,
     reason: row.reason,
+    source: row.source,
     pinTitle: row.pin_title,
     pinNote: row.pin_note,
+    milestoneLabel: row.milestone_label,
+    milestoneKind: row.milestone_kind,
+    sessionID: row.session_id,
+    restoreGroupID: row.restore_group_id,
+    changeSummary: parseChangeSummary(row.change_summary_json),
   };
+}
+
+function serializeChangeSummary(value: SnapshotChangeSummary | null | undefined): string | null {
+  if (!value) {
+    return null;
+  }
+  return JSON.stringify({
+    linesChanged: Math.floor(value.linesChanged),
+    characterDelta: Math.floor(value.characterDelta),
+    byteDelta: value.byteDelta == null ? null : Math.floor(value.byteDelta),
+  });
 }
 
 function readMetadataString(key: string): string | null {
@@ -575,6 +716,11 @@ function writePadSnapshot(padId: string, snapshot: Snapshot): void {
     byte_size: snapshot.byteSize ?? Buffer.byteLength(snapshot.text, "utf8"),
     pin_title: snapshot.pinTitle ?? null,
     pin_note: snapshot.pinNote ?? null,
+    milestone_label: snapshot.milestoneLabel ?? null,
+    milestone_kind: snapshot.milestoneKind ?? null,
+    session_id: snapshot.sessionID ?? null,
+    restore_group_id: snapshot.restoreGroupID ?? null,
+    change_summary_json: serializeChangeSummary(snapshot.changeSummary),
     updated_at_unix: Math.floor(Date.now() / 1_000),
   });
 }
@@ -597,6 +743,11 @@ function ensureSnapshot(padId: string): Snapshot {
     byteSize: 0,
     pinTitle: null,
     pinNote: null,
+    milestoneLabel: null,
+    milestoneKind: null,
+    sessionID: null,
+    restoreGroupID: null,
+    changeSummary: null,
   };
 
   writePadSnapshot(padId, snapshot);
@@ -645,9 +796,106 @@ function buildSnapshotFromPayload(payload: SnapshotPayload): {
     byteSize,
     pinTitle: typeof payload.pinTitle === "string" ? payload.pinTitle.trim() || null : null,
     pinNote: typeof payload.pinNote === "string" ? payload.pinNote.trim() || null : null,
+    milestoneLabel:
+      typeof payload.milestoneLabel === "string" && payload.milestoneLabel.trim()
+        ? payload.milestoneLabel.trim()
+        : null,
+    milestoneKind:
+      typeof payload.milestoneKind === "string" && payload.milestoneKind.trim()
+        ? payload.milestoneKind.trim()
+        : null,
+    sessionID:
+      typeof payload.sessionID === "string" && payload.sessionID.trim()
+        ? payload.sessionID.trim()
+        : null,
+    restoreGroupID:
+      typeof payload.restoreGroupID === "string" && payload.restoreGroupID.trim()
+        ? payload.restoreGroupID.trim()
+        : null,
+    changeSummary: (() => {
+      if (!payload.changeSummary || typeof payload.changeSummary !== "object") {
+        return null;
+      }
+      const maybe = payload.changeSummary as SnapshotChangeSummary;
+      if (
+        typeof maybe.linesChanged !== "number" ||
+        !Number.isFinite(maybe.linesChanged) ||
+        typeof maybe.characterDelta !== "number" ||
+        !Number.isFinite(maybe.characterDelta)
+      ) {
+        return null;
+      }
+      if (
+        maybe.byteDelta != null &&
+        (typeof maybe.byteDelta !== "number" || !Number.isFinite(maybe.byteDelta))
+      ) {
+        return null;
+      }
+      return {
+        linesChanged: Math.floor(maybe.linesChanged),
+        characterDelta: Math.floor(maybe.characterDelta),
+        byteDelta: maybe.byteDelta == null ? null : Math.floor(maybe.byteDelta),
+      };
+    })(),
   };
 
   return { snapshot, receivedBytes };
+}
+
+function parseSnapshotSendMode(value: string | undefined): SnapshotSendMode {
+  if (!value) {
+    return "forced";
+  }
+
+  const normalized = value.trim().toLowerCase();
+  return normalized === "scheduled" ? "scheduled" : "forced";
+}
+
+function parseScheduledAutoCheckpointIntervalSeconds(value: string | undefined): number | null {
+  if (!value) {
+    return null;
+  }
+
+  const parsed = Number(value.trim());
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+
+  const rounded = Math.floor(parsed);
+  return Math.min(12 * 60, Math.max(5 * 60, rounded));
+}
+
+function shouldPromoteAutoSnapshotRecord(
+  padId: string,
+  snapshot: Snapshot,
+  sendMode: SnapshotSendMode,
+  scheduledAutoCheckpointIntervalSeconds: number | null
+): boolean {
+  if (sendMode === "forced") {
+    return true;
+  }
+
+  const reason = snapshot.checkpointReason ?? "autoEditBatch";
+  const source = snapshot.checkpointSource ?? "remote";
+  if (reason !== "autoEditBatch" || source !== "local") {
+    return true;
+  }
+
+  const createdAtUnix = Math.floor(new Date(snapshot.lastModified).getTime() / 1_000);
+  if (!Number.isFinite(createdAtUnix)) {
+    return true;
+  }
+
+  const latest = statements.selectLatestScheduledAutoSnapshotCreatedAt.get(padId) as
+    | SnapshotCreatedAtRow
+    | undefined;
+  if (!latest) {
+    return true;
+  }
+
+  const requiredInterval =
+    scheduledAutoCheckpointIntervalSeconds ?? scheduledAutoTimelinePromotionIntervalSeconds;
+  return createdAtUnix - latest.created_at_unix >= requiredInterval;
 }
 
 function insertSnapshot(
@@ -687,6 +935,11 @@ function insertSnapshot(
     source,
     pin_title: snapshot.pinTitle ?? null,
     pin_note: snapshot.pinNote ?? null,
+    milestone_label: snapshot.milestoneLabel ?? null,
+    milestone_kind: snapshot.milestoneKind ?? null,
+    session_id: snapshot.sessionID ?? null,
+    restore_group_id: snapshot.restoreGroupID ?? null,
+    change_summary_json: serializeChangeSummary(snapshot.changeSummary),
     is_pinned: isPinned ? 1 : 0,
   });
 
@@ -698,8 +951,14 @@ function insertSnapshot(
     language: snapshot.language ?? null,
     byteSize,
     reason,
+    source,
     pinTitle: snapshot.pinTitle ?? null,
     pinNote: snapshot.pinNote ?? null,
+    milestoneLabel: snapshot.milestoneLabel ?? null,
+    milestoneKind: snapshot.milestoneKind ?? null,
+    sessionID: snapshot.sessionID ?? null,
+    restoreGroupID: snapshot.restoreGroupID ?? null,
+    changeSummary: snapshot.changeSummary ?? null,
   };
 }
 
@@ -731,22 +990,108 @@ function normalizeLimit(rawLimit: string | undefined): number {
   return Math.min(200, Math.max(1, Math.floor(parsed)));
 }
 
-function listSnapshots(padId: string, rawCursor: string | undefined, rawLimit: string | undefined): {
+function parseBooleanFilter(raw: string | undefined): boolean | null {
+  if (!raw) return null;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "true" || normalized === "1") return true;
+  if (normalized === "false" || normalized === "0") return false;
+  return null;
+}
+
+function parseStringFilter(raw: string | undefined): string | null {
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function parseDateFilterToUnix(raw: string | undefined): number | null {
+  if (!raw) return null;
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+  return Math.floor(date.getTime() / 1_000);
+}
+
+type SnapshotTimelineFilter = {
+  reason?: string | null;
+  source?: string | null;
+  language?: string | null;
+  deviceID?: string | null;
+  pinned?: boolean | null;
+  milestoneKind?: string | null;
+  fromUnix?: number | null;
+  toUnix?: number | null;
+};
+
+function listSnapshots(
+  padId: string,
+  rawCursor: string | undefined,
+  rawLimit: string | undefined,
+  filters?: SnapshotTimelineFilter
+): {
   snapshots: SnapshotRecord[];
   nextCursor: string | null;
 } {
   const limit = normalizeLimit(rawLimit);
   const fetchLimit = limit + 1;
   const cursor = decodeCursor(rawCursor);
+  const where: string[] = ["pad_id = @pad_id"];
+  const params: Record<string, unknown> = {
+    pad_id: padId,
+    limit: fetchLimit,
+  };
 
-  const rows = cursor
-    ? (statements.listSnapshotsAfterCursor.all({
-        pad_id: padId,
-        created_at_unix: cursor.createdAtUnix,
-        snapshot_id: cursor.snapshotID,
-        limit: fetchLimit,
-      }) as SnapshotRow[])
-    : (statements.listSnapshotsFirstPage.all({ pad_id: padId, limit: fetchLimit }) as SnapshotRow[]);
+  if (cursor) {
+    where.push(
+      "(created_at_unix < @cursor_created_at_unix OR (created_at_unix = @cursor_created_at_unix AND snapshot_id < @cursor_snapshot_id))"
+    );
+    params.cursor_created_at_unix = cursor.createdAtUnix;
+    params.cursor_snapshot_id = cursor.snapshotID;
+  }
+
+  if (filters?.reason) {
+    where.push("reason = @reason");
+    params.reason = filters.reason;
+  }
+  if (filters?.source) {
+    where.push("source = @source");
+    params.source = filters.source;
+  }
+  if (filters?.language) {
+    where.push("language = @language");
+    params.language = filters.language;
+  }
+  if (filters?.deviceID) {
+    where.push("device_id = @device_id");
+    params.device_id = filters.deviceID;
+  }
+  if (filters?.pinned != null) {
+    where.push("is_pinned = @is_pinned");
+    params.is_pinned = filters.pinned ? 1 : 0;
+  }
+  if (filters?.milestoneKind) {
+    where.push("milestone_kind = @milestone_kind");
+    params.milestone_kind = filters.milestoneKind;
+  }
+  if (filters?.fromUnix != null) {
+    where.push("created_at_unix >= @from_unix");
+    params.from_unix = filters.fromUnix;
+  }
+  if (filters?.toUnix != null) {
+    where.push("created_at_unix <= @to_unix");
+    params.to_unix = filters.toUnix;
+  }
+
+  const query = `SELECT snapshot_id, pad_id, text, created_at, created_at_unix, device_id,
+                        language, byte_size, reason, source, pin_title, pin_note,
+                        milestone_label, milestone_kind, session_id, restore_group_id, change_summary_json,
+                        is_pinned
+                 FROM snapshots
+                 WHERE ${where.join(" AND ")}
+                 ORDER BY created_at_unix DESC, snapshot_id DESC
+                 LIMIT @limit`;
+  const rows = db.prepare(query).all(params) as SnapshotRow[];
 
   const hasNext = rows.length > limit;
   const pageRows = hasNext ? rows.slice(0, limit) : rows;
@@ -1024,7 +1369,12 @@ function dbWritableStatus(): boolean {
 }
 
 const writeCanonicalSnapshotTx = db.transaction(
-  (padId: string, incoming: Snapshot): { canonical: Snapshot; accepted: boolean } => {
+  (
+    padId: string,
+    incoming: Snapshot,
+    sendMode: SnapshotSendMode,
+    scheduledAutoCheckpointIntervalSeconds: number | null
+  ): { canonical: Snapshot; accepted: boolean } => {
     const current = ensureSnapshot(padId);
     const incomingDate = new Date(incoming.lastModified);
     const currentDate = new Date(current.lastModified);
@@ -1039,10 +1389,25 @@ const writeCanonicalSnapshotTx = db.transaction(
       version,
     };
 
-    const autoRecord = insertSnapshot(padId, canonical, false);
-    if (autoRecord) {
-      canonical.snapshotID = autoRecord.snapshotID;
-      canonical.checkpointReason = autoRecord.reason || canonical.checkpointReason || null;
+    if (
+      shouldPromoteAutoSnapshotRecord(
+        padId,
+        canonical,
+        sendMode,
+        scheduledAutoCheckpointIntervalSeconds
+      )
+    ) {
+      const autoRecord = insertSnapshot(padId, canonical, false);
+      if (autoRecord) {
+        canonical.snapshotID = autoRecord.snapshotID;
+        canonical.checkpointReason = autoRecord.reason || canonical.checkpointReason || null;
+        canonical.checkpointSource = autoRecord.source || canonical.checkpointSource || null;
+        canonical.milestoneLabel = autoRecord.milestoneLabel ?? canonical.milestoneLabel ?? null;
+        canonical.milestoneKind = autoRecord.milestoneKind ?? canonical.milestoneKind ?? null;
+        canonical.sessionID = autoRecord.sessionID ?? canonical.sessionID ?? null;
+        canonical.restoreGroupID = autoRecord.restoreGroupID ?? canonical.restoreGroupID ?? null;
+        canonical.changeSummary = autoRecord.changeSummary ?? canonical.changeSummary ?? null;
+      }
     }
 
     writePadSnapshot(padId, canonical);
@@ -1071,6 +1436,11 @@ const restoreSnapshotTx = db.transaction(
       byteSize: row.byte_size ?? Buffer.byteLength(row.text, "utf8"),
       pinTitle: row.pin_title,
       pinNote: row.pin_note,
+      milestoneLabel: "After restore",
+      milestoneKind: "restore",
+      sessionID: null,
+      restoreGroupID: null,
+      changeSummary: null,
     };
 
     const autoRecord = insertSnapshot(padId, restored, false, {
@@ -1080,6 +1450,12 @@ const restoreSnapshotTx = db.transaction(
     if (autoRecord) {
       restored.snapshotID = autoRecord.snapshotID;
       restored.checkpointReason = autoRecord.reason || "restore";
+      restored.checkpointSource = autoRecord.source || "restored";
+      restored.milestoneLabel = autoRecord.milestoneLabel ?? restored.milestoneLabel ?? null;
+      restored.milestoneKind = autoRecord.milestoneKind ?? restored.milestoneKind ?? null;
+      restored.sessionID = autoRecord.sessionID ?? restored.sessionID ?? null;
+      restored.restoreGroupID = autoRecord.restoreGroupID ?? restored.restoreGroupID ?? null;
+      restored.changeSummary = autoRecord.changeSummary ?? restored.changeSummary ?? null;
     }
 
     writePadSnapshot(padId, restored);
@@ -1103,6 +1479,11 @@ const clearPadTx = db.transaction((padId: string): Snapshot => {
     byteSize: 0,
     pinTitle: null,
     pinNote: null,
+    milestoneLabel: "After clear",
+    milestoneKind: "semanticEvent",
+    sessionID: null,
+    restoreGroupID: null,
+    changeSummary: null,
   };
 
   const autoRecord = insertSnapshot(padId, cleared, false, {
@@ -1111,6 +1492,13 @@ const clearPadTx = db.transaction((padId: string): Snapshot => {
   });
   if (autoRecord) {
     cleared.snapshotID = autoRecord.snapshotID;
+    cleared.checkpointReason = autoRecord.reason || cleared.checkpointReason || "clear";
+    cleared.checkpointSource = autoRecord.source || cleared.checkpointSource || "remote";
+    cleared.milestoneLabel = autoRecord.milestoneLabel ?? cleared.milestoneLabel ?? null;
+    cleared.milestoneKind = autoRecord.milestoneKind ?? cleared.milestoneKind ?? null;
+    cleared.sessionID = autoRecord.sessionID ?? cleared.sessionID ?? null;
+    cleared.restoreGroupID = autoRecord.restoreGroupID ?? cleared.restoreGroupID ?? null;
+    cleared.changeSummary = autoRecord.changeSummary ?? cleared.changeSummary ?? null;
   }
 
   writePadSnapshot(padId, cleared);
@@ -1137,6 +1525,10 @@ app.get("/pads/:padId", (req, res) => {
 // PUT /pads/:padId – last-writer-wins for this pad
 app.put("/pads/:padId", (req, res) => {
   const padId = req.params.padId;
+  const sendMode = parseSnapshotSendMode(req.header("x-chrony-send-mode"));
+  const scheduledAutoCheckpointIntervalSeconds = parseScheduledAutoCheckpointIntervalSeconds(
+    req.header("x-chrony-auto-checkpoint-interval-sec")
+  );
 
   let parsed: { snapshot: Snapshot; receivedBytes: number };
   try {
@@ -1160,7 +1552,12 @@ app.put("/pads/:padId", (req, res) => {
     return;
   }
 
-  const { canonical, accepted } = writeCanonicalSnapshotTx(padId, parsed.snapshot);
+  const { canonical, accepted } = writeCanonicalSnapshotTx(
+    padId,
+    parsed.snapshot,
+    sendMode,
+    scheduledAutoCheckpointIntervalSeconds
+  );
 
   if (accepted) {
     broadcastSnapshot(padId);
@@ -1185,10 +1582,24 @@ app.get("/pads/:padId/snapshots", (req, res) => {
   const padId = req.params.padId;
   ensureSnapshot(padId);
 
+  const filters: SnapshotTimelineFilter = {
+    reason: parseStringFilter(typeof req.query.reason === "string" ? req.query.reason : undefined),
+    source: parseStringFilter(typeof req.query.source === "string" ? req.query.source : undefined),
+    language: parseStringFilter(typeof req.query.language === "string" ? req.query.language : undefined),
+    deviceID: parseStringFilter(typeof req.query.deviceID === "string" ? req.query.deviceID : undefined),
+    pinned: parseBooleanFilter(typeof req.query.pinned === "string" ? req.query.pinned : undefined),
+    milestoneKind: parseStringFilter(
+      typeof req.query.milestoneKind === "string" ? req.query.milestoneKind : undefined
+    ),
+    fromUnix: parseDateFilterToUnix(typeof req.query.from === "string" ? req.query.from : undefined),
+    toUnix: parseDateFilterToUnix(typeof req.query.to === "string" ? req.query.to : undefined),
+  };
+
   const page = listSnapshots(
     padId,
     typeof req.query.cursor === "string" ? req.query.cursor : undefined,
-    typeof req.query.limit === "string" ? req.query.limit : undefined
+    typeof req.query.limit === "string" ? req.query.limit : undefined,
+    filters
   );
 
   res.json({
@@ -1250,6 +1661,36 @@ app.post("/pads/:padId/restore/:snapshotId", (req, res) => {
 
   broadcastSnapshot(padId);
   res.status(200).json(restored);
+});
+
+app.post("/validate", async (req, res) => {
+  const payload = req.body as DeepValidationRequest;
+
+  try {
+    const response = await validateWithToolchains(payload);
+    res.status(200).json(response);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "validation failed";
+    res.status(500).json({
+      language: "unsupported",
+      profile: "unsupported",
+      diagnostics: [
+        {
+          severity: "info",
+          message: `validation backend failure: ${message}`,
+          line: 1,
+          column: 1,
+          source: "chrony-validate",
+          code: "backend.failure",
+        },
+      ],
+      tools: [],
+      truncated: false,
+      cached: false,
+      generatedAt: new Date().toISOString(),
+      limitedReason: "Validation failed on backend.",
+    });
+  }
 });
 
 app.get("/billing/promotional-offers/status", (_req, res) => {
