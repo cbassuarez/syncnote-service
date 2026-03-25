@@ -526,7 +526,7 @@ function buildSnapshotFromPayload(payload) {
     const payloadText = typeof payload.text === "string" ? payload.text : "";
     const payloadDateRaw = typeof payload.lastModified === "string" ? payload.lastModified : "";
     const payloadDeviceID = typeof payload.deviceID === "string" ? payload.deviceID : "";
-    if (!payloadText || !payloadDateRaw || !payloadDeviceID) {
+    if (typeof payload.text !== "string" || !payloadDateRaw || !payloadDeviceID) {
         throw new Error("Invalid snapshot payload");
     }
     const incomingDate = new Date(payloadDateRaw);
